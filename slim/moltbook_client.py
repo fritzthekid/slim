@@ -93,14 +93,14 @@ def get_comments(post_id: str) -> list:
     r = requests.get(f"{BASE_URL}/posts/{post_id}/comments",
                      headers=_headers(), timeout=15)
     data = r.json()
-    return data.get("data", {}).get("comments", [])
+    return data.get("comments", data.get("data", {}).get("comments", []))
 
 
 def feed(sort: str = "hot", limit: int = 10) -> list:
     r = requests.get(f"{BASE_URL}/feed", params={"sort": sort, "limit": limit},
                      headers=_headers(), timeout=15)
     data = r.json()
-    return data.get("data", {}).get("posts", [])
+    return data.get("posts", data.get("data", {}).get("posts", []))
 
 
 def mark_notifications_read(post_id: str) -> dict:
@@ -121,3 +121,37 @@ def unsubscribe(submolt: str) -> dict:
 def list_submolts() -> list:
     r = requests.get(f"{BASE_URL}/submolts", headers=_headers(), timeout=15)
     return r.json().get("submolts", [])
+
+def seach_posts(search_string: str) -> list:
+    r = requests.get(f"{BASE_URL}/search?q={search_string}", headers=_headers(), timeout=15)
+    with open("/tmp/posts.json", "w") as f:
+        f.write(json.dumps(r.json(), indent=2))
+    real_posts = [p for p in r.json().get("results") if p.get("type") == "post"]
+    return real_posts
+
+def get_agent_name() -> str:
+    data = json.loads(REGISTER_FILE.read_text())
+    return data["agent"]["name"]
+
+
+def get_own_posts(agent_name: str, limit: int = 10) -> list:
+    r = requests.get(f"{BASE_URL}/agents/profile",
+                     params={"name": agent_name}, headers=_headers(), timeout=15)
+    data = r.json()
+    return data.get("recentPosts", [])
+
+
+def get_submolt_posts(submolt: str, sort: str = "new", limit: int = 10) -> list:
+    r = requests.get(f"{BASE_URL}/submolts/{submolt}/feed",
+                     params={"sort": sort, "limit": limit},
+                     headers=_headers(), timeout=15)
+    data = r.json()
+    return data.get("posts", data.get("data", {}).get("posts", []))
+
+
+def search_posts(query: str, limit: int = 20) -> list:
+    r = requests.get(f"{BASE_URL}/search",
+                     params={"q": query, "type": "posts", "limit": limit},
+                     headers=_headers(), timeout=15)
+    data = r.json()
+    return data.get("results", [])

@@ -6,6 +6,8 @@ import time
 import ollama
 from flask import Flask, request, jsonify
 import moltbook_client as mb
+from datetime import datetime
+import random
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -202,8 +204,8 @@ def cmd_mb_post(topic: str, submolt: str = "general"):
     prompt = (
         f"Write a Moltbook post on the topic: '{topic}'.\n"
         "Format (follow exactly):\n"
-        "TITLE: <title, max 300 chars>\n"
-        "CONTENT: <body, max 800 chars>"
+        "TITLE: <title, max 500 chars>\n"
+        "CONTENT: <body, max 480 chars>"
     )
     raw = ask(prompt, messages)
 
@@ -252,7 +254,7 @@ def cmd_mb_browse(limit: int = 10):
     selected = posts[choice - 1]
     post_id = selected["id"]
     post_title = selected.get("title", "")
-    post_content = selected.get("content", "")
+    post_content = re.sub(r"<[^>]+>", "", selected.get("content", ""))
 
     print(f"\n── Selected post ─────────────────────────")
     print(f"Title:   {post_title}")
@@ -298,40 +300,96 @@ def moltbook_status():
     print(f"Msg:    {data.get('message', '')}")
 
 
-def heartbeat():
-    """Single heartbeat run: check notifications and reply."""
-    print("[Heartbeat] Fetching /home ...")
-    home = mb.home()
-    data = home.get("data", {})
 
-    # Reply to unread comments on own posts
-    notifications = data.get("notifications", [])
+def heartbeat():
+    """Check all own posts for unanswered comments and reply."""
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"{now_str}: [Heartbeat] Fetching own posts ...")
+
+    agent_name = mb.get_agent_name()
+    own_posts  = mb.get_own_posts(agent_name)
+    logger.info(f"[Heartbeat] own posts: {len(own_posts)}")
+
     replied = 0
-    for n in notifications:
-        if n.get("type") in ("comment_reply", "post_comment") and not n.get("read"):
-            post_id = n.get("post_id")
-            comment_id = n.get("comment_id")
-            if not post_id:
+    for post in own_posts:
+        post_id = post.get("id")
+        if not post_id:
+            continue
+        comments = mb.get_comments(post_id)
+        for c in comments:
+            # skip own comments
+            if c.get("author", {}).get("name") == agent_name:
                 continue
-            # Fetch comment content
-            comments = mb.get_comments(post_id)
-            trigger = next((c for c in comments if c.get("id") == comment_id), None)
-            if not trigger:
+            # skip if we already replied to this comment
+            already = any(
+                r.get("author", {}).get("name") == agent_name
+                for r in c.get("replies", [])
+            )
+            if already:
                 continue
-            question = trigger.get("content", "")
-            messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+            question = re.sub(r"<[^>]+>", "", c.get("content", "")).strip()
+            if not question:
+                continue
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             reply = ask(question, messages)
-            mb.comment(post_id, reply, parent_id=comment_id)
-            mb.mark_notifications_read(post_id)
-            logger.info(f"[Heartbeat] Replied to: {question[:60]!r}")
+            result = mb.comment(post_id, reply, parent_id=c.get("id"),
+                                challenge_solver=_llm_solve_challenge)
+            if result.get("success"):
+                author = c.get("author", {}).get("name", "?")
+                logger.info(f"[Heartbeat] Replied to {author}: {question[:60]!r}")
+                print(f"[Heartbeat] Replied to {author}")
+                replied += 1
+
+    # Upvote top posts from feed (skip own)
+    feed_posts = mb.feed(sort="hot", limit=10)
+    upvoted = 0
+    for p in feed_posts:
+        if p.get("author", {}).get("name") == agent_name:
+            continue
+        mb.upvote_post(p["id"])
+        upvoted += 1
+        if upvoted >= 3:
+            break
+
+    inventory = [
+        "wind+power",
+        "open+source",
+        "energy",
+        "value+based+software",
+        "social+media+teaching",
+        "media+literacy+teaching",
+        "teach+kids+act+responsible",
+    ]
+
+    candidates = [
+        p for p in (cmd_mb_search_posts(random.sample(inventory, 1)) or [])
+        if p.get("author", {}).get("name") != agent_name
+    ]
+    # Skip posts we already commented on
+    not_yet_commented = []
+    for p in candidates[:10]:
+        existing = mb.get_comments(p["id"])
+        if any(c.get("author", {}).get("name") == agent_name for c in existing):
+            continue
+        not_yet_commented.append(p)
+    samples = random.sample(not_yet_commented, min(len(not_yet_commented), 3))
+    for p in samples:
+        mb.upvote_post(p["id"])
+        upvoted += 1
+        question = re.sub(r"<[^>]+>", "", p.get("content", "")).strip()
+        if not question:
+            continue
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        reply = ask(question, messages)
+        result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+        if result.get("success"):
+            author = p.get("author", {}).get("name", "?")
+            logger.info(f"[Heartbeat] Commented on search result by {author}: {question[:60]!r}")
+            print(f"[Heartbeat] Commented on search result by {author}")
             replied += 1
 
-    # Upvote interesting posts from feed
-    posts = mb.feed(sort="hot", limit=10)
-    for p in posts[:3]:
-        mb.upvote_post(p["id"])
+    print(f"[Heartbeat] {replied} reply(s) posted, {upvoted} post(s) upvoted.")
 
-    print(f"[Heartbeat] {replied} reply(s) posted, {min(3, len(posts))} post(s) upvoted.")
 
 
 
@@ -354,10 +412,37 @@ def cmd_mb_submolts():
     if not submolts:
         print("No submolts found.")
         return
-    print(f"
-── Submolts ({len(submolts)}) ──────────────────────")
+    print(f"── Submolts ({len(submolts)}) ──────────────────────")
     for s in submolts:
         print(f"  {s.get('name','?'):20}  {s.get('display_name','')}")
+
+def cmd_mb_search_posts(search_string: str):
+    """search all posts according to search_string."""
+    print(f"search_string: {search_string}")
+    posts = mb.search_posts(search_string) or []
+    posts.sort(key=lambda x: x["created_at"], reverse=True)
+    if not posts:
+        print("No posts found.")
+        return
+    print(f"── posts found ({len(posts)}) ──────────────────────")
+    for p in posts[:10]:
+        print(f"  {p.get("author").get("name","?")}: {p.get("title","?")}")
+    return posts
+
+def cmd_mb_submolt_posts(submolt: str, limit: int = 10):
+    """List recent posts from a submolt."""
+    posts = mb.get_submolt_posts(submolt, sort="new", limit=limit)
+    if not posts:
+        print(f"No posts found in '{submolt}'.")
+        return
+    print(f"\n── {submolt} (latest {len(posts)}) ──────────────────")
+    for i, p in enumerate(posts, 1):
+        author = p.get("author", {}).get("name", "?")
+        upvotes = p.get("upvotes", 0)
+        comments = p.get("comment_count", 0)
+        print(f"[{i:2}] {p.get('title','?')[:60]}")
+        print(f"      @{author}  ↑{upvotes}  💬{comments}  id:{p.get('id','?')[:8]}")
+    print()
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -383,6 +468,14 @@ if __name__ == "__main__":
                         help="Unsubscribe from a submolt")
     parser.add_argument("--mb-submolts", action="store_true",
                         help="List all submolts")
+    parser.add_argument("--mb-submolt-posts", metavar="SUBMOLT",
+                        help="List recent posts from a submolt")
+    parser.add_argument("--mb-limit", type=int, default=10,
+                        help="Number of posts to show (default: 10)")
+    parser.add_argument("--mb-search-posts", metavar="SEARCH_STRING",
+                        help="search all posts according to search_string")
+    parser.add_argument("--mb_limit", type=int, default=10,
+                        help="Number of posts to show (default: 10)")
     args = parser.parse_args()
 
     if args.status:
@@ -399,6 +492,10 @@ if __name__ == "__main__":
         cmd_mb_subscribe(args.mb_unsubscribe, unsubscribe=True)
     elif args.mb_submolts:
         cmd_mb_submolts()
+    elif args.mb_search_posts:
+        cmd_mb_search_posts(args.mb_search_posts)
+    elif args.mb_submolt_posts:
+        cmd_mb_submolt_posts(args.mb_submolt_posts, args.mb_limit)
     elif args.serve:
         serve(args.host, args.port)
     else:

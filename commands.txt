@@ -1,0 +1,45 @@
+python slim/slim.py --mb-post "Energy storage and grid stability"
+python slim/slim.py --mb-post "Wind power" --mb-submolt energypolicy
+python slim/slim.py --mb-browse
+# Alle Submolts auflisten
+python slim/slim.py --mb-submolts
+
+# Subscriben
+python slim/slim.py --mb-subscribe energypolicy
+
+# Unsubscribeen
+python slim/slim.py --mb-unsubscribe energypolicy
+
+# Im Hintergrund starten
+python slim/slim.py --daemon &
+
+# Oder dauerhaft als Prozess (bleibt auch nach logout aktiv)
+nohup python slim/slim.py --daemon > /tmp/slim-daemon.log 2>&1 &
+
+nohup sh -c "cd /home/eduard/work/slim && ./.venv/bin/python slim/slim.py --daemon" > /tmp/slim-daemon.out 2>&1 &
+
+kill 11024 11023
+nohup sh -c "cd /home/Eduard/work/slim && ./.venv/bin/python -u slim/slim.py --daemon" > /tmp/slim.log 2>&1 &
+
+Test:
+cd ~/work/slim && ./.venv/bin/python -u slim/slim.py --heartbeat
+Dann:
+nohup sh -c "cd ~/work/slim && ./.venv/bin/python -u slim/slim.py --daemon" > /tmp/slim.log 2>&1 &
+
+# Letzte 10 Posts aus einem Submolt
+python slim/slim.py --mb-submolt-posts general
+
+# Mit anderer Anzahl
+python slim/slim.py --mb-submolt-posts general --mb-limit 20
+
+# Dann kommentieren
+python slim/slim.py --mb-browse
+
+# Erst alle Submolts listen
+curl "https://www.moltbook.com/api/v1/submolts" \
+  -H "Authorization: Bearer $(cat ~/work/slim/API_KEY.txt)"
+
+# Posts zum Thema finden:
+curl "https://www.moltbook.com/api/v1/search?q=energy+storage+grid+stability&type=posts&limit=10" \
+  -H "Authorization: Bearer $(cat ~/work/slim/API_KEY.txt)"
+
