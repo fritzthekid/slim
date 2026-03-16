@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import argparse
 import logging
@@ -8,6 +9,7 @@ from flask import Flask, request, jsonify
 import moltbook_client as mb
 from datetime import datetime
 import random
+import json
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -59,13 +61,24 @@ SYSTEM_PROMPT = (
 )
 
 
+_NO_INFO_PHRASES = (
+    "i have no information on this topic",
+    "ich habe keine informationen",
+)
+
+
+def _is_no_info_reply(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in _NO_INFO_PHRASES)
+
+
 def lookup_knowledge(text: str) -> str | None:
     """Returns the matching handbook entry, or None."""
-    lower = text.lower()
-    for key, value in MOLTBOOK_KNOWLEDGE.items():
-        if key.lower() in lower:
-            logger.info(f"[Knowledge hit] key='{key}' → {value}")
-            return value
+    # lower = text.lower()
+    # for key, value in MOLTBOOK_KNOWLEDGE.items():
+    #     if key.lower() in lower:
+    #         logger.info(f"[Knowledge hit] key='{key}' → {value}")
+    #         return value
     return None
 
 
@@ -182,20 +195,173 @@ def serve(host: str = "0.0.0.0", port: int = 5000):
 
 # ── Moltbook post / reply ──────────────────────────────────────────────────────
 
+_WORD_NUMS = [
+    ('hundred', 100), ('ninety', 90), ('eighty', 80), ('seventy', 70),
+    ('sixty', 60), ('fifty', 50), ('forty', 40), ('thirty', 30),
+    ('twenty', 20),
+    ('nineteen', 19), ('nineten', 19),    # nineten = nineteen after dedup
+    ('eighteen', 18), ('eighten', 18),    # eighten = eighteen after dedup
+    ('seventeen', 17), ('seventen', 17),  # seventen = seventeen after dedup
+    ('sixteen', 16), ('sixten', 16),      # sixten = sixteen after dedup
+    ('fifteen', 15), ('fiften', 15),      # fiften = fifteen after dedup (fif+ten)
+    ('fourteen', 14), ('fourten', 14),    # fourten = fourteen after dedup
+    ('thirteen', 13), ('thirten', 13),    # thirten = thirteen after dedup
+    ('twelve', 12), ('eleven', 11), ('ten', 10), ('nine', 9), ('eight', 8),
+    ('seven', 7), ('six', 6), ('five', 5), ('four', 4),
+    ('three', 3), ('thre', 3),            # thre = three after dedup
+    ('two', 2), ('one', 1), ('zero', 0),
+]
+
+
+def _extract_numbers(text: str) -> list:
+    """Extract numbers handling split words. Word-by-word primary, no-space fallback.
+    Tens+units (e.g. twenty+two=22) are combined only when positionally adjacent,
+    so separate operands like "twenty meters ... five" are NOT merged."""
+    # Try plain digits first
+    digits = [float(m) for m in re.findall(r'\b\d+(?:\.\d+)?\b', text)]
+    if len(digits) >= 2:
+        return digits
+
+    def _scan_words(word_list):
+        """Scan word list; track (value, start_idx, end_idx) for adjacency check."""
+        word_map = {w: v for w, v in _WORD_NUMS}
+        nums = []  # (value, start_word_idx, end_word_idx)
+        i = 0
+        while i < len(word_list):
+            matched = False
+            for length in (3, 2, 1):
+                if i + length > len(word_list):
+                    continue
+                combo = ''.join(word_list[i:i + length])
+                if combo in word_map:
+                    nums.append((word_map[combo], i, i + length - 1))
+                    i += length
+                    matched = True
+                    break
+            if not matched:
+                i += 1
+        # Combine tens+units only when adjacent words
+        combined = []
+        i = 0
+        while i < len(nums):
+            val, _s, end = nums[i]
+            if (i + 1 < len(nums)
+                    and 20 <= val <= 90 and val % 10 == 0
+                    and 1 <= nums[i + 1][0] <= 9
+                    and nums[i + 1][1] == end + 1):
+                combined.append(val + nums[i + 1][0])
+                i += 2
+            else:
+                combined.append(val)
+                i += 1
+        return combined
+
+    def _scan_nospace(text):
+        """Scan all chars without spaces; combine tens+units only when adjacent chars."""
+        alpha = re.sub(r'[^a-z]', '', text.lower())
+        nums = []  # (value, start_pos, end_pos)
+        pos = 0
+        while pos < len(alpha):
+            for word, val in _WORD_NUMS:
+                if alpha[pos:pos + len(word)] == word:
+                    nums.append((val, pos, pos + len(word)))
+                    pos += len(word)
+                    break
+            else:
+                pos += 1
+        # Combine adjacent tens+units
+        combined = []
+        i = 0
+        while i < len(nums):
+            val, _s, end = nums[i]
+            if (i + 1 < len(nums)
+                    and 20 <= val <= 90 and val % 10 == 0
+                    and 1 <= nums[i + 1][0] <= 9
+                    and nums[i + 1][1] == end):
+                combined.append(val + nums[i + 1][0])
+                i += 2
+            else:
+                combined.append(val)
+                i += 1
+        return combined
+
+    words = [re.sub(r'[^a-z]', '', w) for w in text.lower().split()]
+    words = [w for w in words if w]
+
+    # Primary: word-by-word (no false positives from substrings)
+    wb_nums = _scan_words(words)
+    # Use word-by-word if it found 2+ numbers and at least one is >= 10
+    if len(wb_nums) >= 2 and max(wb_nums) >= 10:
+        return wb_nums if len(wb_nums) == 2 else [wb_nums[0], wb_nums[-1]]
+
+    # Fallback: no-space scan (handles extreme fragmentation like "tw ent y")
+    ns_nums = _scan_nospace(text)
+    if len(ns_nums) >= 2:
+        return ns_nums if len(ns_nums) == 2 else [ns_nums[0], ns_nums[-1]]
+
+    # Last resort: whatever word-by-word found
+    return wb_nums
+
+
+def _detect_op(text: str) -> str:
+    low = text.lower()
+    # Also check nospace for operation words fragmented by obfuscation symbols.
+    # 'speed' and 'distance' are checked only in spaced text to avoid false positives
+    # (e.g. "spe ed" in a question like "what's the new speed?").
+    ns = re.sub(r'\s+', '', low)
+    if any(w in low or w in ns for w in ('divid', 'split', 'averag')):
+        return '/'
+    if any(w in low or w in ns for w in ('product', 'multipli', 'times', 'travel', 'how far')):
+        return '*'
+    if any(w in low for w in ('distance', 'speed')):
+        return '*'
+    if any(w in low or w in ns for w in ('reduc', 'remain', 'minus', 'subtract', 'less',
+                                          'los', 'remov', 'decreas', 'slo', 'fal', 'drop', 'lose')):
+        return '-'
+    return '+'
+
+
 def _llm_solve_challenge(challenge_text: str) -> str:
-    """Solves the Moltbook verification challenge via LLM."""
+    """Solves the Moltbook verification challenge deterministically, LLM as fallback."""
+    # Step 1: strip special chars
+    cleaned = re.sub(r'[^a-zA-Z0-9 ]', ' ', challenge_text)
+    # Step 2: collapse consecutive duplicate letters (thirrty->thirty, fivvee->five)
+    result = []
+    i = 0
+    while i < len(cleaned):
+        c = cleaned[i]
+        result.append(c)
+        while i + 1 < len(cleaned) and cleaned[i+1].lower() == c.lower() and c != ' ' and not c.isdigit():
+            i += 1
+        i += 1
+    cleaned = re.sub(r'\s+', ' ', ''.join(result)).strip().lower()
+    # Step 3: extract numbers and operation
+    nums = _extract_numbers(cleaned)
+    unique_nums = []
+    for n in nums:
+        if not unique_nums or n != unique_nums[-1]:
+            unique_nums.append(n)
+    nums = unique_nums
+    print(f"[Challenge] cleaned: {cleaned!r}", flush=True)
+    if len(nums) >= 2:
+        op = _detect_op(cleaned)
+        result_val = {'+': nums[0] + nums[1], '-': nums[0] - nums[1], '*': nums[0] * nums[1], '/': nums[0] / nums[1] if nums[1] else 0}[op]
+        answer = f"{result_val:.2f}"
+        print(f"[Challenge] nums={nums} op={op!r} -> {answer}", flush=True)
+        logger.info(f"[Challenge] nums={nums} op={op!r} answer={answer}")
+        return answer
+    # Fallback: LLM
     resp = ollama.chat(model=ENGINE, messages=[
         {'role': 'system', 'content':
-            'You solve math word problems. Reply with ONLY the number, '
-            'e.g. "15.00". No explanatory text.'},
-        {'role': 'user', 'content':
-            f'Solve this problem and reply with only the number:\n{challenge_text}'},
+            'Solve the math problem. Reply with ONLY the number to 2 decimal places (e.g. "55.00").'},
+        {'role': 'user', 'content': f'Problem: {cleaned}\nAnswer:'},
     ])
     raw = resp['message']['content'].strip()
     m = re.search(r'-?[\d]+(?:[.,][\d]+)?', raw)
-    if m:
-        return f"{float(m.group().replace(',', '.')):.2f}"
-    return "0.00"
+    answer = f"{float(m.group().replace(',', '.')):.2f}" if m else "0.00"
+    print(f"[Challenge] LLM fallback -> {answer}", flush=True)
+    logger.info(f"[Challenge] LLM fallback answer={answer}")
+    return answer
 
 
 def cmd_mb_post(topic: str, submolt: str = "general"):
@@ -290,6 +456,28 @@ def cmd_mb_browse(limit: int = 10):
 
 # ── Moltbook integration ───────────────────────────────────────────────────────
 
+AUDIT_THRESHOLD = 6  # minimum alignment score (1-10) to engage with a post
+
+
+def audit_post(post_content: str) -> dict:
+    """Score a post 1-10 for alignment with agent values. Returns {score, reason}."""
+    snippet = post_content[:200]
+    prompt = (
+        'Evaluate the following post based on these values:\n'
+        '1. Ecological Sustainability\n'
+        '2. Regional Open-Source & Local Initiatives\n'
+        '3. Digital Sovereignty & Social Justice\n\n'
+        f'Post: "{snippet}"\n\n'
+        'Give a score from 1-10 for alignment and a 1-sentence reason.\n'
+        'Format: {"score": int, "reason": "string"}'
+    )
+    resp = ollama.generate(model=ENGINE, prompt=prompt, format="json")
+    try:
+        return json.loads(resp.response)
+    except (json.JSONDecodeError, KeyError):
+        return {"score": 0, "reason": "parse error"}
+
+
 def moltbook_status():
     """Show current Moltbook account status."""
     data = mb.status()
@@ -308,7 +496,7 @@ def heartbeat():
 
     agent_name = mb.get_agent_name()
     own_posts  = mb.get_own_posts(agent_name)
-    logger.info(f"[Heartbeat] own posts: {len(own_posts)}")
+    print(f"[Heartbeat] {len(own_posts)} own post(s) found.", flush=True)
 
     replied = 0
     for post in own_posts:
@@ -332,6 +520,9 @@ def heartbeat():
                 continue
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             reply = ask(question, messages)
+            if _is_no_info_reply(reply):
+                logger.info(f"[Heartbeat] Skipping no-info reply for: {question[:60]!r}")
+                continue
             result = mb.comment(post_id, reply, parent_id=c.get("id"),
                                 challenge_solver=_llm_solve_challenge)
             if result.get("success"):
@@ -340,16 +531,42 @@ def heartbeat():
                 print(f"[Heartbeat] Replied to {author}")
                 replied += 1
 
-    # Upvote top posts from feed (skip own)
-    feed_posts = mb.feed(sort="hot", limit=10)
+    print("[Heartbeat] Fetching feed ...", flush=True)
+    # Pick 3 feed posts, comment on all, upvote only if audit passes
+    feed_posts = [
+        p for p in mb.feed(sort="hot", limit=10)
+        if p.get("author", {}).get("name") != agent_name
+    ]
     upvoted = 0
+    # Skip posts already commented on
+    feed_not_commented = []
     for p in feed_posts:
-        if p.get("author", {}).get("name") == agent_name:
+        existing = mb.get_comments(p["id"])
+        if any(c.get("author", {}).get("name") == agent_name for c in existing):
             continue
-        mb.upvote_post(p["id"])
-        upvoted += 1
-        if upvoted >= 3:
-            break
+        feed_not_commented.append(p)
+    feed_sample = random.sample(feed_not_commented, min(len(feed_not_commented), 3))
+    for p in feed_sample:
+        content = re.sub(r"<[^>]+>", "", p.get("content", "")).strip()
+        if not content:
+            continue
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        print(f"[Heartbeat] Asking LLM to comment on: {content[:50]!r} ...", flush=True)
+        reply = ask(content, messages)
+        if not _is_no_info_reply(reply):
+            result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+            if result.get("success"):
+                author = p.get("author", {}).get("name", "?")
+                logger.info(f"[Heartbeat] Feed comment posted for {author}: {content[:60]!r}")
+                replied += 1
+        # audit = audit_post(content)
+        # score = audit.get("score", 0)
+        # if score >= AUDIT_THRESHOLD:
+        #     mb.upvote_post(p["id"])
+        #     upvoted += 1
+        #     logger.info(f"[Heartbeat] Upvoted (score {score}): {content[:60]!r}")
+        # else:
+        #     logger.info(f"[Heartbeat] Not upvoted (score {score}): {audit.get('reason')}")
 
     inventory = [
         "wind+power",
@@ -359,10 +576,17 @@ def heartbeat():
         "social+media+teaching",
         "media+literacy+teaching",
         "teach+kids+act+responsible",
+        "design+new+products",
+        "ideas+start+up+business",
+        "design+ideas",
+        "sustainability",
+        "renewables",
+        "europe",
     ]
 
+    print("[Heartbeat] Searching posts ...", flush=True)
     candidates = [
-        p for p in (cmd_mb_search_posts(random.sample(inventory, 1)) or [])
+        p for p in (cmd_mb_search_posts(random.choice(inventory)) or [])
         if p.get("author", {}).get("name") != agent_name
     ]
     # Skip posts we already commented on
@@ -372,21 +596,29 @@ def heartbeat():
         if any(c.get("author", {}).get("name") == agent_name for c in existing):
             continue
         not_yet_commented.append(p)
+    # Sample 3 first, then audit only those
     samples = random.sample(not_yet_commented, min(len(not_yet_commented), 3))
     for p in samples:
-        mb.upvote_post(p["id"])
-        upvoted += 1
         question = re.sub(r"<[^>]+>", "", p.get("content", "")).strip()
         if not question:
             continue
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         reply = ask(question, messages)
-        result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
-        if result.get("success"):
-            author = p.get("author", {}).get("name", "?")
-            logger.info(f"[Heartbeat] Commented on search result by {author}: {question[:60]!r}")
-            print(f"[Heartbeat] Commented on search result by {author}")
-            replied += 1
+        if not _is_no_info_reply(reply):
+            result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+            if result.get("success"):
+                author = p.get("author", {}).get("name", "?")
+                logger.info(f"[Heartbeat] Commented on search result by {author}: {question[:60]!r}")
+                print(f"[Heartbeat] Commented on search result by {author}")
+                replied += 1
+        # audit = audit_post(question)
+        # score = audit.get("score", 0)
+        # if score >= AUDIT_THRESHOLD:
+        #     mb.upvote_post(p["id"])
+        #     upvoted += 1
+        #     logger.info(f"[Heartbeat] Upvoted search result (score {score}): {question[:60]!r}")
+        # else:
+        #     logger.info(f"[Heartbeat] Not upvoted (score {score}): {audit.get('reason')}")
 
     print(f"[Heartbeat] {replied} reply(s) posted, {upvoted} post(s) upvoted.")
 
@@ -424,6 +656,10 @@ def cmd_mb_search_posts(search_string: str):
     if not posts:
         print("No posts found.")
         return
+    with open("/tmp/slim_posts.json", "w") as f:
+        f.write(json.dumps(posts, indent=2))
+    with open("/tmp/slim_search_string.txt", "w") as f:
+        f.write(search_string)
     print(f"── posts found ({len(posts)}) ──────────────────────")
     for p in posts[:10]:
         print(f"  {p.get("author").get("name","?")}: {p.get("title","?")}")
@@ -474,8 +710,11 @@ if __name__ == "__main__":
                         help="Number of posts to show (default: 10)")
     parser.add_argument("--mb-search-posts", metavar="SEARCH_STRING",
                         help="search all posts according to search_string")
+    parser.add_argument("--audit-text", default="general",
+                        help="Audit text (content of a post)")
     parser.add_argument("--mb_limit", type=int, default=10,
                         help="Number of posts to show (default: 10)")
+
     args = parser.parse_args()
 
     if args.status:
@@ -498,5 +737,8 @@ if __name__ == "__main__":
         cmd_mb_submolt_posts(args.mb_submolt_posts, args.mb_limit)
     elif args.serve:
         serve(args.host, args.port)
+    elif args.audit_text:
+        audit = audit_post(args.audit_text)
+        print(f"Text: {args.audit_text!r}: Score: {audit}")
     else:
         chat()
