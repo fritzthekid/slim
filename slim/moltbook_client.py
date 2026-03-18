@@ -53,8 +53,8 @@ def _post(path: str, body: dict, challenge_solver=None) -> dict:
                                  "answer": answer},
                            headers=_headers(), timeout=(5, 15))
         result = r2.json()
-        logger.info(f"[Verify] answer={answer!r} result={result}")
-        print(f"[Verify] answer={answer!r} → {result}", flush=True)
+        if not result.get("success"):
+            logger.warning(f"[Verify] FAILED challenge={v.get('challenge_text','')!r} answer={answer!r} result={result}")
         return result
     return data
 
@@ -152,9 +152,21 @@ def get_submolt_posts(submolt: str, sort: str = "new", limit: int = 10) -> list:
     return data.get("posts", data.get("data", {}).get("posts", []))
 
 
+def get_post(post_id: str) -> dict:
+    r = requests.get(f"{BASE_URL}/posts/{post_id}", headers=_headers(), timeout=(5, 15))
+    data = r.json()
+    return data.get("post", data)
+
+
 def search_posts(query: str, limit: int = 20) -> list:
     r = requests.get(f"{BASE_URL}/search",
                      params={"q": query, "type": "posts", "limit": limit},
                      headers=_headers(), timeout=(5, 15))
     data = r.json()
     return data.get("results", [])
+
+def get_own_comments(agent_name: str, limit: int = 100) -> list:
+    """GET /agents/{name}/comments — returns up to 100 most recent comments with post info."""
+    r = requests.get(f"{BASE_URL}/agents/{agent_name}/comments",
+                     params={"limit": limit}, headers=_headers(), timeout=(5, 15))
+    return r.json().get("comments", [])

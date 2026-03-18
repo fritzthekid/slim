@@ -42,6 +42,21 @@ MOLTBOOK_KNOWLEDGE = {**_FACTS, **{k: _FACTS[v] for k, v in _DE_ALIASES.items()}
 
 ENGINE = "progressive-qwen02:latest"
 
+_COMMENTED_CACHE = os.path.expanduser("~/.slim_commented_posts.json")
+
+
+def _load_commented() -> set:
+    try:
+        return set(json.load(open(_COMMENTED_CACHE)))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _save_commented(post_ids: set):
+    # Keep only the last 500 to avoid unbounded growth
+    ids = sorted(post_ids)[-500:]
+    json.dump(ids, open(_COMMENTED_CACHE, "w"))
+
 SYSTEM_PROMPT = (
     # ── Moltbook identity ──────────────────────────────────────────────────────
     "You are the technical core of the Moltbook network. "
@@ -342,14 +357,10 @@ def _llm_solve_challenge(challenge_text: str) -> str:
         if not unique_nums or n != unique_nums[-1]:
             unique_nums.append(n)
     nums = unique_nums
-    print(f"[Challenge] cleaned: {cleaned!r}", flush=True)
     if len(nums) >= 2:
         op = _detect_op(cleaned)
         result_val = {'+': nums[0] + nums[1], '-': nums[0] - nums[1], '*': nums[0] * nums[1], '/': nums[0] / nums[1] if nums[1] else 0}[op]
-        answer = f"{result_val:.2f}"
-        print(f"[Challenge] nums={nums} op={op!r} -> {answer}", flush=True)
-        logger.info(f"[Challenge] nums={nums} op={op!r} answer={answer}")
-        return answer
+        return f"{result_val:.2f}"
     # Fallback: LLM
     resp = ollama.chat(model=ENGINE, messages=[
         {'role': 'system', 'content':
@@ -359,8 +370,7 @@ def _llm_solve_challenge(challenge_text: str) -> str:
     raw = resp['message']['content'].strip()
     m = re.search(r'-?[\d]+(?:[.,][\d]+)?', raw)
     answer = f"{float(m.group().replace(',', '.')):.2f}" if m else "0.00"
-    print(f"[Challenge] LLM fallback -> {answer}", flush=True)
-    logger.info(f"[Challenge] LLM fallback answer={answer}")
+    logger.info(f"[Challenge] LLM fallback cleaned={cleaned!r} answer={answer}")
     return answer
 
 
@@ -492,11 +502,9 @@ def moltbook_status():
 def heartbeat():
     """Check all own posts for unanswered comments and reply."""
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"{now_str}: [Heartbeat] Fetching own posts ...")
-
     agent_name = mb.get_agent_name()
     own_posts  = mb.get_own_posts(agent_name)
-    print(f"[Heartbeat] {len(own_posts)} own post(s) found.", flush=True)
+    print(f"{now_str}: [Heartbeat] {len(own_posts)} own post(s), checking feed + search ...", flush=True)
 
     replied = 0
     for post in own_posts:
@@ -523,41 +531,47 @@ def heartbeat():
             if _is_no_info_reply(reply):
                 logger.info(f"[Heartbeat] Skipping no-info reply for: {question[:60]!r}")
                 continue
-            result = mb.comment(post_id, reply, parent_id=c.get("id"),
-                                challenge_solver=_llm_solve_challenge)
+            try:
+                result = mb.comment(post_id, reply, parent_id=c.get("id"),
+                                    challenge_solver=_llm_solve_challenge)
+            except Exception as exc:
+                logger.warning(f"[Heartbeat] comment failed: {exc}")
+                continue
             if result.get("success"):
                 author = c.get("author", {}).get("name", "?")
                 logger.info(f"[Heartbeat] Replied to {author}: {question[:60]!r}")
-                print(f"[Heartbeat] Replied to {author}")
+                print(f"[Heartbeat] → replied to {author}", flush=True)
                 replied += 1
 
-    print("[Heartbeat] Fetching feed ...", flush=True)
     # Pick 3 feed posts, comment on all, upvote only if audit passes
     feed_posts = [
         p for p in mb.feed(sort="hot", limit=10)
         if p.get("author", {}).get("name") != agent_name
+        and not p.get("is_spam")
     ]
     upvoted = 0
     # Skip posts already commented on
-    feed_not_commented = []
-    for p in feed_posts:
-        existing = mb.get_comments(p["id"])
-        if any(c.get("author", {}).get("name") == agent_name for c in existing):
-            continue
-        feed_not_commented.append(p)
+    commented_ids = _load_commented()
+    feed_not_commented = [p for p in feed_posts if p["id"] not in commented_ids]
     feed_sample = random.sample(feed_not_commented, min(len(feed_not_commented), 3))
     for p in feed_sample:
         content = re.sub(r"<[^>]+>", "", p.get("content", "")).strip()
         if not content:
             continue
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        print(f"[Heartbeat] Asking LLM to comment on: {content[:50]!r} ...", flush=True)
         reply = ask(content, messages)
         if not _is_no_info_reply(reply):
-            result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+            commented_ids.add(p["id"])
+            _save_commented(commented_ids)
+            try:
+                result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+            except Exception as exc:
+                logger.warning(f"[Heartbeat] comment failed: {exc}")
+                continue
             if result.get("success"):
                 author = p.get("author", {}).get("name", "?")
                 logger.info(f"[Heartbeat] Feed comment posted for {author}: {content[:60]!r}")
+                print(f"[Heartbeat] → commented on post by {author}", flush=True)
                 replied += 1
         # audit = audit_post(content)
         # score = audit.get("score", 0)
@@ -584,18 +598,15 @@ def heartbeat():
         "europe",
     ]
 
-    print("[Heartbeat] Searching posts ...", flush=True)
+    keyword = random.choice(inventory)
+    raw_candidates = mb.search_posts(keyword) or []
     candidates = [
-        p for p in (cmd_mb_search_posts(random.choice(inventory)) or [])
+        p for p in raw_candidates
         if p.get("author", {}).get("name") != agent_name
+        and not p.get("is_spam")
     ]
     # Skip posts we already commented on
-    not_yet_commented = []
-    for p in candidates[:10]:
-        existing = mb.get_comments(p["id"])
-        if any(c.get("author", {}).get("name") == agent_name for c in existing):
-            continue
-        not_yet_commented.append(p)
+    not_yet_commented = [p for p in candidates[:10] if p["id"] not in commented_ids]
     # Sample 3 first, then audit only those
     samples = random.sample(not_yet_commented, min(len(not_yet_commented), 3))
     for p in samples:
@@ -605,11 +616,17 @@ def heartbeat():
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         reply = ask(question, messages)
         if not _is_no_info_reply(reply):
-            result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+            commented_ids.add(p["id"])
+            _save_commented(commented_ids)
+            try:
+                result = mb.comment(p["id"], reply, challenge_solver=_llm_solve_challenge)
+            except Exception as exc:
+                logger.warning(f"[Heartbeat] comment failed: {exc}")
+                continue
             if result.get("success"):
                 author = p.get("author", {}).get("name", "?")
                 logger.info(f"[Heartbeat] Commented on search result by {author}: {question[:60]!r}")
-                print(f"[Heartbeat] Commented on search result by {author}")
+                print(f"[Heartbeat] → commented on post by {author}", flush=True)
                 replied += 1
         # audit = audit_post(question)
         # score = audit.get("score", 0)
@@ -620,7 +637,7 @@ def heartbeat():
         # else:
         #     logger.info(f"[Heartbeat] Not upvoted (score {score}): {audit.get('reason')}")
 
-    print(f"[Heartbeat] {replied} reply(s) posted, {upvoted} post(s) upvoted.")
+    print(f"{now_str}: [Heartbeat] done — {replied} published.", flush=True)
 
 
 
@@ -662,7 +679,10 @@ def cmd_mb_search_posts(search_string: str):
         f.write(search_string)
     print(f"── posts found ({len(posts)}) ──────────────────────")
     for p in posts[:10]:
-        print(f"  {p.get("author").get("name","?")}: {p.get("title","?")}")
+        author = p.get("author", {}).get("name", "?")
+        title = p.get("title", "?")[:55]
+        pid = p.get("id", "?")
+        print(f"  {pid}  @{author}: {title}")
     return posts
 
 def cmd_mb_submolt_posts(submolt: str, limit: int = 10):
@@ -677,8 +697,53 @@ def cmd_mb_submolt_posts(submolt: str, limit: int = 10):
         upvotes = p.get("upvotes", 0)
         comments = p.get("comment_count", 0)
         print(f"[{i:2}] {p.get('title','?')[:60]}")
-        print(f"      @{author}  ↑{upvotes}  💬{comments}  id:{p.get('id','?')[:8]}")
+        print(f"      @{author}  ↑{upvotes}  💬{comments}  id:{p.get('id','?')}")
     print()
+
+
+def cmd_export_activity(output_path: str = None):
+    """Export all own comments with their parent posts to a Markdown file."""
+    agent_name = mb.get_agent_name()
+    comments = mb.get_own_comments(agent_name)
+    if not comments:
+        print("No comments found.")
+        return
+
+    if output_path is None:
+        output_path = os.path.expanduser(f"~/{agent_name}_activity.md")
+
+    lines = [
+        f"# {agent_name} — Activity Export",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"Comments exported: {len(comments)}",
+        "",
+    ]
+
+    for c in comments:
+        post = c.get("post", {})
+        post_title = post.get("title", "(no title)")
+        submolt = post.get("submolt", {}).get("name", "?")
+        post_id = post.get("id", "")
+        date = c.get("created_at", "")[:10]
+        upvotes = c.get("upvotes", 0)
+        spam_note = " *(spam)*" if c.get("is_spam") else ""
+        unverified = " *(unverified)*" if c.get("verification_status") != "verified" else ""
+
+        lines += [
+            "---",
+            f"### Post: {post_title}",
+            f"m/{submolt} · <https://www.moltbook.com/posts/{post_id}>",
+            "",
+            f"**Comment** ({date}, ↑{upvotes}{spam_note}{unverified}):",
+            "",
+            c.get("content", "").strip(),
+            "",
+        ]
+
+    text = "\n".join(lines)
+    with open(output_path, "w") as f:
+        f.write(text)
+    print(f"Exported {len(comments)} comment(s) → {output_path}")
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -710,10 +775,14 @@ if __name__ == "__main__":
                         help="Number of posts to show (default: 10)")
     parser.add_argument("--mb-search-posts", metavar="SEARCH_STRING",
                         help="search all posts according to search_string")
-    parser.add_argument("--audit-text", default="general",
+    parser.add_argument("--audit-text", metavar="POST_ID",
                         help="Audit text (content of a post)")
+    parser.add_argument("--audit-post", metavar="POST_ID",
+                        help="Fetch post by ID and audit its content")
     parser.add_argument("--mb_limit", type=int, default=10,
                         help="Number of posts to show (default: 10)")
+    parser.add_argument("--export", metavar="FILE", nargs="?", const="",
+                        help="Export own comments + posts to Markdown (default: ~/fritzenergydict_activity.md)")
 
     args = parser.parse_args()
 
@@ -740,5 +809,17 @@ if __name__ == "__main__":
     elif args.audit_text:
         audit = audit_post(args.audit_text)
         print(f"Text: {args.audit_text!r}: Score: {audit}")
+    elif args.export is not None:
+        cmd_export_activity(args.export if args.export else None)
+    elif args.audit_post:
+        p = mb.get_post(args.audit_post)
+        text = re.sub(r"<[^>]+>", "", p.get("content", "")).strip()
+        title = p.get("title", "")
+        spam_flag = "  ⚠ marked as spam" if p.get("is_spam") else ""
+        audit = audit_post(f"{title}\n{text}" if title else text)
+        print(f"Post {args.audit_post!r}:{spam_flag}")
+        print(f"  Title:  {title}")
+        print(f"  Score:  {audit.get('score')}/10")
+        print(f"  Reason: {audit.get('reason')}")
     else:
         chat()
