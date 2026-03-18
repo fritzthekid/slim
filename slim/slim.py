@@ -701,10 +701,10 @@ def cmd_mb_submolt_posts(submolt: str, limit: int = 10):
     print()
 
 
-def cmd_export_activity(output_path: str = None):
-    """Export all own comments with their parent posts to a Markdown file."""
+def cmd_export_activity(output_path: str = None, limit: int = 100):
+    """Export own comments with their parent post content to a Markdown file."""
     agent_name = mb.get_agent_name()
-    comments = mb.get_own_comments(agent_name)
+    comments = mb.get_own_comments(agent_name, limit=limit)
     if not comments:
         print("No comments found.")
         return
@@ -712,29 +712,52 @@ def cmd_export_activity(output_path: str = None):
     if output_path is None:
         output_path = os.path.expanduser(f"~/{agent_name}_activity.md")
 
+    # Fetch full post content for each unique post (one API call per post)
+    unique_post_ids = list(dict.fromkeys(c["post"]["id"] for c in comments))
+    print(f"Fetching {len(unique_post_ids)} post(s) ...", flush=True)
+    post_cache = {}
+    for pid in unique_post_ids:
+        try:
+            post_cache[pid] = mb.get_post(pid)
+        except Exception as exc:
+            logger.warning(f"[Export] get_post failed for {pid}: {exc}")
+
     lines = [
         f"# {agent_name} — Activity Export",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"Comments exported: {len(comments)}",
+        f"Comments exported: {len(comments)} across {len(unique_post_ids)} post(s)",
         "",
     ]
 
+    last_post_id = None
     for c in comments:
-        post = c.get("post", {})
-        post_title = post.get("title", "(no title)")
-        submolt = post.get("submolt", {}).get("name", "?")
-        post_id = post.get("id", "")
+        post_stub = c.get("post", {})
+        post_id = post_stub.get("id", "")
+        post_data = post_cache.get(post_id, {})
+        post_title = post_stub.get("title", post_data.get("title", "(no title)"))
+        submolt = post_stub.get("submolt", {}).get("name", "?")
+        post_content = re.sub(r"<[^>]+>", "", post_data.get("content", "")).strip()
+        post_spam = " *(post marked as spam)*" if post_data.get("is_spam") else ""
+
         date = c.get("created_at", "")[:10]
         upvotes = c.get("upvotes", 0)
         spam_note = " *(spam)*" if c.get("is_spam") else ""
         unverified = " *(unverified)*" if c.get("verification_status") != "verified" else ""
 
+        # Only print the post header + content once per post
+        if post_id != last_post_id:
+            lines += [
+                "---",
+                f"## Post: {post_title}{post_spam}",
+                f"m/{submolt} · <https://www.moltbook.com/posts/{post_id}>",
+                "",
+            ]
+            if post_content:
+                lines += [post_content, ""]
+            last_post_id = post_id
+
         lines += [
-            "---",
-            f"### Post: {post_title}",
-            f"m/{submolt} · <https://www.moltbook.com/posts/{post_id}>",
-            "",
-            f"**Comment** ({date}, ↑{upvotes}{spam_note}{unverified}):",
+            f"**fritz comment** ({date}, ↑{upvotes}{spam_note}{unverified}):",
             "",
             c.get("content", "").strip(),
             "",
@@ -783,6 +806,8 @@ if __name__ == "__main__":
                         help="Number of posts to show (default: 10)")
     parser.add_argument("--export", metavar="FILE", nargs="?", const="",
                         help="Export own comments + posts to Markdown (default: ~/fritzenergydict_activity.md)")
+    parser.add_argument("--export-limit", type=int, default=100,
+                        help="Max comments to export (default: 100, max the API allows)")
 
     args = parser.parse_args()
 
@@ -810,7 +835,7 @@ if __name__ == "__main__":
         audit = audit_post(args.audit_text)
         print(f"Text: {args.audit_text!r}: Score: {audit}")
     elif args.export is not None:
-        cmd_export_activity(args.export if args.export else None)
+        cmd_export_activity(args.export if args.export else None, limit=args.export_limit)
     elif args.audit_post:
         p = mb.get_post(args.audit_post)
         text = re.sub(r"<[^>]+>", "", p.get("content", "")).strip()
